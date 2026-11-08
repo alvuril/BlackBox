@@ -1,0 +1,40 @@
+name: Build Windows app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - name: Build (folder build, no UPX, with version info)
+        run: pyinstaller --noconfirm --onedir --windowed --noupx --name BlackBox --version-file version_info.txt blackbox.py
+      - name: Zip and hash
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/BlackBox -DestinationPath BlackBox-windows.zip
+          $hash = (Get-FileHash BlackBox-windows.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  BlackBox-windows.zip" | Out-File -Encoding ascii BlackBox-windows.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlackBox
+          path: |
+            BlackBox-windows.zip
+            BlackBox-windows.zip.sha256
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            BlackBox-windows.zip
+            BlackBox-windows.zip.sha256
