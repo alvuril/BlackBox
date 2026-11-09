@@ -4,6 +4,8 @@ A flight recorder for your Windows PC. It quietly records what your computer is 
 
 Task Manager only shows what's happening right now. Black Box remembers.
 
+![BlackBox](Screenshot2026-11-09205053.png)
+
 ## Download
 
 1. Go to the [Releases](../../releases) page and download `BlackBox-windows.zip`.
