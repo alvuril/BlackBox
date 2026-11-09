@@ -24,18 +24,21 @@ except Exception:
     pass
 
 VERSION = "1.0.0"
-FONT = "Segoe UI"
-W, H, PAD = 760, 640, 28
-ACCENT, WARN, CRIT, OK = "#6ea8fe", "#f6c177", "#eb6f92", "#6fd9a0"
-MEM_COLOR, DISK_COLOR = "#b79cff", "#ffb86b"
+BODY, HEAD, MONO = "Segoe UI", "Bahnschrift", "Consolas"
+W, H, PAD, SB = 940, 676, 28, 190          # window, outer padding, sidebar width
+CW = W - SB - 2 * PAD                       # width of the content area
+OKC, WARN, CRIT = "#8bd17c", "#ff9f43", "#ff5d5d"
+CPU_C, MEM_C, DISK_C = "#ffb454", "#7cc7ff", "#c792ea"
 SELF = "blackbox"
 DATA_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "BlackBox")
 DB_PATH = os.path.join(DATA_DIR, "history.db")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 
 THEMES = {
-    "Dark": dict(bg="#0f1115", track="#1c2028", calm="#2a3140", text="#e8eaed", muted="#6f7685"),
-    "Light": dict(bg="#f6f7f9", track="#e3e6eb", calm="#cfd6e2", text="#1b1e24", muted="#7a8190"),
+    "Dark": dict(bg="#14110f", side="#1a1613", card="#201b17", line="#322b24", bar="#4a3f33",
+                 text="#f1e9df", muted="#8f8478", acc="#ffb454", ontop="#1a1208"),
+    "Light": dict(bg="#f4efe8", side="#ebe4da", card="#fbf8f3", line="#ddd3c6", bar="#cdbfae",
+                  text="#2a231c", muted="#8a7f72", acc="#d9822b", ontop="#ffffff"),
 }
 DEFAULTS = {
     "record_enabled": True, "interval": 5, "keep_days": 3,
@@ -57,6 +60,12 @@ SETTING_ROWS = [
     ("Start with Windows (minimized)", "start_with_windows", TOGGLE, None),
     ("Open data folder", "open_folder", ACTION, None),
     ("Clear recorded history", "clear", ACTION, None),
+]
+SETTING_GROUPS = [
+    ("RECORDING", ["record_enabled", "interval", "keep_days"]),
+    ("WHAT COUNTS AS OVERLOADED", ["th_cpu", "th_mem", "th_disk"]),
+    ("APP", ["theme", "close_minimizes", "start_with_windows"]),
+    ("DATA", ["open_folder", "clear"]),
 ]
 
 # What common programs are doing, in plain English: (description, what helps)
@@ -150,8 +159,9 @@ def clip(text, n):
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
-def est_height(text, size, width=W - 2 * PAD):
+def est_height(text, size, width=None):
     """Rough height of wrapped canvas text (the canvas can't tell us before drawing)."""
+    width = width or CW - 40
     per_line = max(20, int(width / (size * 0.62) * 0.92))
     return math.ceil(max(len(text), 1) / per_line) * int(size * 1.75)
 
@@ -484,14 +494,16 @@ class App:
     def __init__(self, root, minimized=False, db_path=None):
         self.root = root
         self.s = load_settings()
-        self.view, self.hits, self.detail = "main", [], None
+        self.view, self.hits, self.detail, self.live = "main", [], None, None
         self.rows, self.levels, self.incidents, self.inc_cache = [], [], [], {}
         self.t0 = self.t1 = 0.0
+        self.plot = (SB + PAD + 16, W - PAD - 16)
         root.title("Black Box")
         root.geometry(f"{W}x{H}")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.hfont = tkfont.Font(root=root, family=FONT, size=9, weight="bold")
+        self.hfont = tkfont.Font(root=root, family=HEAD, size=9, weight="bold")
+        self.mfont = tkfont.Font(root=root, family=HEAD, size=10, weight="bold")
         self.c = tk.Canvas(root, width=W, height=H, highlightthickness=0, bd=0)
         self.c.pack()
         self.c.bind("<Button-1>", self.on_click)
@@ -532,6 +544,7 @@ class App:
                 self.inc_cache[key] = explain(window, self.th)
             inc["info"] = self.inc_cache[key]
         self.incidents = found
+        self.live = explain(load(self.db, now - 30, now, procs=True), self.th) if self.rows else None
         if len(self.inc_cache) > 200:
             self.inc_cache.clear()
 
@@ -544,6 +557,18 @@ class App:
         except sqlite3.Error:
             pass
         self.root.after(5000, self.tick)
+
+    def status(self):
+        if not self.s["record_enabled"]:
+            return "idle", "Recording is paused", "Press Resume in the sidebar to start recording again."
+        if not self.rows or time.time() - self.rows[-1]["ts"] > 3 * self.s["interval"] + 30:
+            return "idle", "Waiting for data", "Black Box has just started, or has no recent samples yet."
+        if self.live and self.live["stressed"]:
+            return "slow", "Your PC is struggling right now", clip(self.live["short"], 62)
+        if self.incidents:
+            inc = self.incidents[0]
+            return "ok", "Running smoothly", clip(f"Last slow moment: {fmt_time(inc['start'])}. {inc['info']['short']}", 62)
+        return "ok", "Running smoothly", "No slow moments in this period."
 
     def open_range(self, c0, c1, title, focus=None):
         rows = load(self.db, c0, c1, procs=True)
@@ -564,7 +589,8 @@ class App:
 
     def open_bucket(self, ev, _d=1):
         size = (self.t1 - self.t0) / 96
-        i = max(0, min(95, int((ev.x - PAD) / ((W - 2 * PAD) / 96))))
+        a, b = self.plot
+        i = max(0, min(95, int((ev.x - a) / ((b - a) / 96))))
         mid = self.t0 + (i + 0.5) * size
         half = max(size / 2, 60)
         self.open_range(mid - half, mid + half, f"{fmt_time(mid - half)} to {fmt_clock(mid + half)}")
@@ -606,6 +632,14 @@ class App:
         self.refresh()
         self.draw()
 
+    def cycle_range(self, *_):
+        hours = [h for h, _ in RANGES]
+        cur = self.s["view_hours"]
+        self.set_value("view_hours", hours[(hours.index(cur) + 1) % len(hours)] if cur in hours else 24)
+
+    def toggle_recording(self, *_):
+        self.set_value("record_enabled", not self.s["record_enabled"])
+
     def setting_action(self, key, kind, opts, direction):
         if kind == TOGGLE:
             self.set_value(key, not self.s[key])
@@ -628,89 +662,146 @@ class App:
                 self.draw()
 
     # -- drawing helpers --
-    def header(self, buttons, status=True):
-        c, t = self.c, self.t
-        c.create_text(PAD, 30, text="BLACK BOX", anchor="w", fill=t["muted"], font=self.hfont)
-        if status:
-            on = self.s["record_enabled"]
-            c.create_text(PAD + self.hfont.measure("BLACK BOX") + 16, 30, anchor="w",
-                          text="● RECORDING" if on else "○ PAUSED", fill=OK if on else t["muted"], font=self.hfont)
-        x = W - PAD
-        for text, cb, color in buttons:
-            w = self.hfont.measure(text)
-            c.create_text(x, 30, text=text, anchor="e", fill=color, font=self.hfont)
-            self.hits.append((x - w - 6, 8, x + 6, 52, cb))
-            x -= w + 20
+    def text(self, x, y, s, size=10, color=None, weight="normal", fam=BODY, anchor="w", width=None):
+        kw = {"width": width} if width else {}
+        return self.c.create_text(x, y, text=s, anchor=anchor, fill=color or self.t["text"],
+                                  font=(fam, size, weight), **kw)
 
-    def section(self, y, text, right=None, right_cb=None):
-        c, t = self.c, self.t
-        c.create_text(PAD, y, text=text, anchor="w", fill=t["muted"], font=self.hfont)
-        if right:
-            w = self.hfont.measure(right)
-            c.create_text(W - PAD, y, text=right, anchor="e", fill=ACCENT if right_cb else t["muted"], font=self.hfont)
-            if right_cb:
-                self.hits.append((W - PAD - w - 8, y - 12, W - PAD + 8, y + 12, right_cb))
+    def rrect(self, x0, y0, x1, y1, r, fill, outline=""):
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+               x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+        return self.c.create_polygon(pts, smooth=True, fill=fill, outline=outline)
+
+    def card(self, x0, y0, x1, y1, r=12):
+        return self.rrect(x0, y0, x1, y1, r, self.t["card"], self.t["line"])
+
+    def caps(self, x, y, s, anchor="w", color=None):
+        self.text(x, y, s, 9, color or self.t["muted"], "bold", HEAD, anchor)
 
     def level_color(self, lv):
         t = self.t
         if lv is None:
-            return t["track"]
-        return t["calm"] if lv < 0.5 else ACCENT if lv < 0.8 else WARN if lv < 1 else CRIT
+            return t["line"]
+        return t["bar"] if lv < 0.75 else WARN if lv < 1 else CRIT
 
-    def cycle_range(self, *_):
-        hours = [h for h, _ in RANGES]
-        cur = self.s["view_hours"]
-        self.set_value("view_hours", hours[(hours.index(cur) + 1) % len(hours)] if cur in hours else 24)
+    def shell(self, active):
+        """Sidebar that stays the same on every screen."""
+        c, t = self.c, self.t
+        c.create_rectangle(0, 0, SB, H, fill=t["side"], outline="")
+        c.create_line(SB, 0, SB, H, fill=t["line"])
+        c.create_oval(21, 29, 47, 55, outline=t["acc"], width=3)
+        c.create_oval(30, 38, 38, 46, fill=t["acc"], outline="")
+        self.text(58, 38, "Black Box", 15, weight="bold", fam=HEAD)
+        self.text(58, 56, f"v{VERSION}", 8, t["muted"])
+        for i, (name, view) in enumerate((("Overview", "main"), ("Settings", "settings"))):
+            y = 112 + i * 44
+            on = view == active
+            if on:
+                self.rrect(12, y - 18, SB - 12, y + 18, 8, t["card"], t["line"])
+                c.create_rectangle(12, y - 10, 15, y + 10, fill=t["acc"], outline="")
+            self.text(32, y, name, 11, t["text"] if on else t["muted"], "bold" if on else "normal", HEAD)
+            self.hits.append((12, y - 18, SB - 12, y + 18, lambda e, d, v=view: self.go(v)))
+        rec = self.s["record_enabled"]
+        top = H - 128
+        self.card(12, top, SB - 12, top + 60, 10)
+        c.create_oval(26, top + 18, 34, top + 26, fill=OKC if rec else t["muted"], outline="")
+        self.text(42, top + 22, "Recording" if rec else "Paused", 11, weight="bold", fam=HEAD)
+        self.text(26, top + 43, "Click to pause" if rec else "Click to resume", 8, t["muted"])
+        self.hits.append((12, top, SB - 12, top + 60, lambda e, d: self.toggle_recording()))
+        self.text(26, H - 38, "Quit Black Box", 9, t["muted"])
+        self.hits.append((12, H - 52, SB - 12, H - 24, lambda e, d: self.quit()))
 
-    def toggle_recording(self, *_):
-        self.set_value("record_enabled", not self.s["record_enabled"])
-
-    # -- views --
+    # -- screens --
     def draw(self):
         self.c.delete("all")
         self.hits = []
-        {"main": self.draw_main, "detail": self.draw_detail, "settings": self.draw_settings}[self.view]()
+        self.shell("settings" if self.view == "settings" else "main")
+        {"main": self.draw_overview, "detail": self.draw_detail, "settings": self.draw_settings}[self.view]()
 
-    def draw_main(self):
-        c, t = self.c, self.t
-        self.header([("SETTINGS", lambda e, d: self.go("settings"), t["muted"]),
-                     ("PAUSE" if self.s["record_enabled"] else "RESUME", lambda e, d: self.toggle_recording(), ACCENT),
-                     ("QUIT", lambda e, d: self.quit(), t["muted"])])
-        # the big question
-        c.create_rectangle(PAD, 58, W - PAD, 106, fill=ACCENT, outline=ACCENT)
-        c.create_text(W // 2, 82, text="Why is my PC slow right now?", fill="#0b0d12", font=(FONT, 13, "bold"))
-        self.hits.append((PAD, 58, W - PAD, 106, lambda e, d: self.ask_now()))
-        c.create_text(PAD, 124, anchor="w", fill=t["muted"], font=(FONT, 9),
-                      text="Looks at the last 2 minutes of recorded activity and tells you what's using your PC.")
-        # timeline
-        label_ = dict(RANGES).get(self.s["view_hours"], "LAST 24 HOURS")
-        self.section(158, "TIMELINE", label_ + "  ▾", lambda e, d: self.cycle_range())
-        sw = (W - 2 * PAD) / 96
+    def draw_overview(self):
+        t = self.t
+        x0, x1 = SB + PAD, W - PAD
+        self.text(x0, 38, "Overview", 20, weight="bold", fam=HEAD)
+        rng = dict(RANGES).get(self.s["view_hours"], "LAST 24 HOURS").capitalize() + "  ▾"
+        w = self.mfont.measure(rng) + 32
+        self.rrect(x1 - w, 22, x1, 54, 16, t["card"], t["line"])
+        self.text(x1 - w / 2, 38, rng, 10, t["acc"], "bold", HEAD, "center")
+        self.hits.append((x1 - w, 22, x1, 54, lambda e, d: self.cycle_range()))
+
+        # status card + the big question
+        kind, headline, sub = self.status()
+        color = {"ok": OKC, "slow": CRIT, "idle": t["muted"]}[kind]
+        self.card(x0, 72, x1, 160)
+        self.c.create_oval(x0 + 16, 109, x0 + 30, 123, fill=color, outline="")
+        self.text(x0 + 44, 104, headline, 18, color if kind != "idle" else t["text"], "bold", HEAD)
+        self.text(x0 + 44, 134, sub, 10, t["muted"])
+        self.rrect(x1 - 214, 94, x1 - 18, 138, 22, t["acc"])
+        self.text(x1 - 116, 116, "Why is it slow?", 12, t["ontop"], "bold", HEAD, "center")
+        self.hits.append((x1 - 214, 94, x1 - 18, 138, lambda e, d: self.ask_now()))
+
+        # live tiles
+        last = self.rows[-1] if self.rows else None
+        tw = (x1 - x0 - 24) / 3
+        for i, (name, key) in enumerate((("CPU", "cpu"), ("MEMORY", "mem"), ("DISK", "disk"))):
+            tx = x0 + i * (tw + 12)
+            self.card(tx, 172, tx + tw, 234)
+            self.caps(tx + 16, 186, name)
+            v = last[key] if last else None
+            self.text(tx + 16, 208, "n/a" if v is None else f"{v:.0f}%", 18,
+                      CRIT if v is not None and v >= self.th[key] else t["text"], "bold", MONO)
+            self.c.create_line(tx + 16, 224, tx + tw - 16, 224, width=4, capstyle="round", fill=t["line"])
+            if v:
+                self.c.create_line(tx + 16, 224, tx + 16 + (tw - 32) * min(v, 100) / 100, 224, width=4,
+                                   capstyle="round", fill=CRIT if v >= self.th[key] else t["acc"])
+
+        # activity bars
+        self.caps(x0, 254, "ACTIVITY")
+        self.text(x1, 254, "bars above the dashed line were overloaded. Click one to see what happened.",
+                  9, t["muted"], anchor="e")
+        self.card(x0, 266, x1, 386)
+        a, b, base = x0 + 16, x1 - 16, 362
+        self.plot = (a, b)
+        bw = (b - a) / 96
         for i, lv in enumerate(self.levels or [None] * 96):
-            c.create_rectangle(PAD + i * sw, 178, PAD + (i + 1) * sw - 1, 224, fill=self.level_color(lv), outline="")
-        self.hits.append((PAD, 178, W - PAD, 224, self.open_bucket))
-        c.create_text(PAD, 238, text=fmt_time(self.t0) if self.t0 else "", anchor="w", fill=t["muted"], font=(FONT, 9))
-        c.create_text(W - PAD, 238, text="now", anchor="e", fill=t["muted"], font=(FONT, 9))
-        c.create_text(W // 2, 238, text="click any part of the timeline to see what happened", fill=t["muted"], font=(FONT, 9))
+            if lv is None:
+                self.c.create_line(a + i * bw + 1, base, a + (i + 1) * bw - 1, base, fill=t["line"])
+                continue
+            h = max(3, min(lv, 1.25) / 1.25 * 80)
+            self.c.create_rectangle(a + i * bw + 0.5, base - h, a + (i + 1) * bw - 0.5, base,
+                                    fill=self.level_color(lv), outline="")
+        self.c.create_line(a, base - 64, b, base - 64, fill=t["muted"], dash=(3, 3))
+        self.text(a, 376, fmt_time(self.t0) if self.t0 else "", 8, t["muted"])
+        self.text(b, 376, "now", 8, t["muted"], anchor="e")
+        self.hits.append((x0, 266, x1, 386, self.open_bucket))
+
         # slow moments
-        self.section(278, "SLOW MOMENTS", f"{len(self.incidents)} found" if self.incidents else None)
-        y = 306
+        self.caps(x0, 404, "SLOW MOMENTS")
+        if self.incidents:
+            self.caps(x1, 404, f"{len(self.incidents)} FOUND", "e")
+        y = 422
         if not self.incidents:
-            msg = ("No slow moments in this period." if self.rows
+            self.card(x0, y, x1, y + 48)
+            msg = ("Nothing overloaded in this period." if self.rows
                    else "Recording has just started. Slow moments will show up here.")
-            c.create_text(PAD, y + 8, text=msg, anchor="w", fill=t["muted"], font=(FONT, 10))
-        for inc in self.incidents:
+            self.text(x0 + 18, y + 24, msg, 10, t["muted"])
+        for inc in self.incidents[:4]:
             info = inc["info"]
             dur = inc["end"] - inc["start"] + self.s["interval"]
-            c.create_text(PAD, y, text=fmt_time(inc["start"]), anchor="w", fill=t["text"], font=(FONT, 10, "bold"))
-            c.create_text(PAD + 130, y, text=fmt_dur(dur), anchor="w", fill=t["muted"], font=(FONT, 10))
+            key, pk = info["chip"] or ("cpu", 0)
+            tone = CRIT if pk >= 97 else WARN
+            self.card(x0, y, x1, y + 48)
+            self.rrect(x0 + 6, y + 8, x0 + 10, y + 40, 2, tone)
+            self.text(x0 + 22, y + 16, fmt_time(inc["start"]), 11, weight="bold", fam=MONO)
+            self.text(x0 + 170, y + 16, fmt_dur(dur), 10, t["muted"])
             if info["chip"]:
-                key, pk = info["chip"]
-                c.create_text(W - PAD, y, anchor="e", font=self.hfont, fill=CRIT if pk >= 97 else WARN,
-                              text=f"{ {'disk': 'DISK', 'cpu': 'CPU', 'mem': 'MEMORY'}[key] } {pk:.0f}%")
-            c.create_text(PAD, y + 20, text=clip(info["short"], 105), anchor="w", fill=t["muted"], font=(FONT, 10))
-            self.hits.append((PAD, y - 14, W - PAD, y + 32, lambda e, d, i=inc: self.open_incident(i)))
-            y += 56
+                chip = f"{ {'disk': 'DISK', 'cpu': 'CPU', 'mem': 'MEMORY'}[key] } {pk:.0f}%"
+                cw = self.hfont.measure(chip) + 22
+                self.rrect(x1 - cw - 14, y + 7, x1 - 14, y + 27, 10, tone)
+                self.text(x1 - 14 - cw / 2, y + 17, chip, 9, t["ontop"], "bold", HEAD, "center")
+            self.text(x0 + 22, y + 35, clip(info["short"], 100), 9, t["muted"])
+            self.hits.append((x0, y, x1, y + 48, lambda e, d, i=inc: self.open_incident(i)))
+            y += 54
+
         # footer tip
         path = (os.environ.get("SystemDrive", "C:") + "\\") if os.name == "nt" else "/"
         try:
@@ -719,91 +810,116 @@ class App:
             used = 0
         name = path.rstrip("\\/") or path
         if used >= 85:
-            c.create_text(PAD, H - 28, anchor="w", fill=WARN, font=(FONT, 10),
-                          text=f"Drive {name} is {used:.0f}% full. A nearly full system drive slows Windows down on its own.")
+            self.text(x0, H - 22, f"Drive {name} is {used:.0f}% full. A nearly full system drive slows Windows down on its own.",
+                      10, WARN)
         else:
-            c.create_text(PAD, H - 28, anchor="w", fill=t["muted"], font=(FONT, 9),
-                          text=f"{len(self.rows):,} samples in this view. Recording works while the window is minimized.")
+            self.text(x0, H - 22, f"{len(self.rows):,} samples in this view. Recording keeps going while the window is minimized.",
+                      9, t["muted"])
 
     def draw_detail(self):
-        c, t, d = self.c, self.t, self.detail
-        self.header([("BACK", lambda e, k: self.go("main"), ACCENT)], status=False)
-        info, y = d["info"], 62
-        c.create_text(PAD, y, text=d["title"], anchor="w", fill=t["text"], font=(FONT, 14, "bold"))
-        y += 28
-        c.create_text(PAD, y, text=info["headline"], anchor="nw", width=W - 2 * PAD, font=(FONT, 11, "bold"),
-                      fill=CRIT if info["stressed"] else t["text"])
-        y += est_height(info["headline"], 11) + 6
+        t, d = self.t, self.detail
+        x0, x1 = SB + PAD, W - PAD
+        info = d["info"]
+        self.text(x0, 30, "‹  Overview", 10, t["acc"], "bold", HEAD)
+        self.hits.append((x0 - 6, 14, x0 + 110, 46, lambda e, k: self.go("main")))
+        self.text(x0, 66, d["title"], 20, weight="bold", fam=HEAD)
+        # verdict card, sized to its text
+        h = 18 + est_height(info["headline"], 12) + 8 + sum(est_height(l, 10) + 6 for l in info["lines"]) + 8
+        y = 92
+        self.card(x0, y, x1, y + h)
+        self.rrect(x0 + 6, y + 10, x0 + 10, y + h - 10, 2, CRIT if info["stressed"] else OKC)
+        ty = y + 16
+        self.text(x0 + 24, ty, info["headline"], 12, CRIT if info["stressed"] else t["text"], "bold", HEAD,
+                  "nw", CW - 48)
+        ty += est_height(info["headline"], 12) + 8
         for line in info["lines"]:
-            c.create_text(PAD, y, text=line, anchor="nw", width=W - 2 * PAD, fill=t["text"], font=(FONT, 10))
-            y += est_height(line, 10) + 6
-        y = self.chart(y + 8, d)
+            self.text(x0 + 24, ty, line, 10, anchor="nw", width=CW - 48)
+            ty += est_height(line, 10) + 6
+        y = self.chart(y + h + 14, d)
         self.table(y + 14, info["table"])
 
     def chart(self, y, d):
-        c, t, h = self.c, self.t, 120
-        x0, x1 = PAD, W - PAD
+        c, t, h = self.c, self.t, 124
+        x0, x1 = SB + PAD, W - PAD
+        px0, px1, top, base = x0 + 16, x1 - 16, y + 30, y + h - 22
         span = max(d["c1"] - d["c0"], 1)
-        c.create_rectangle(x0, y, x1, y + h, fill=t["track"], outline="")
+        self.card(x0, y, x1, y + h)
         if d["focus"]:
-            fa = x0 + (d["focus"][0] - d["c0"]) / span * (x1 - x0)
-            fb = x0 + (d["focus"][1] - d["c0"]) / span * (x1 - x0)
-            c.create_rectangle(max(x0, fa), y, min(x1, max(fb, fa + 3)), y + h, fill=t["calm"], outline="")
-        for key, color in (("cpu", ACCENT), ("mem", MEM_COLOR), ("disk", DISK_COLOR)):
+            fa = px0 + (d["focus"][0] - d["c0"]) / span * (px1 - px0)
+            fb = px0 + (d["focus"][1] - d["c0"]) / span * (px1 - px0)
+            c.create_rectangle(max(px0, fa), top, min(px1, max(fb, fa + 3)), base, fill=t["line"], outline="")
+        for frac in (0, 0.5, 1):
+            c.create_line(px0, base - frac * (base - top), px1, base - frac * (base - top), fill=t["line"])
+        for key, color in (("cpu", CPU_C), ("mem", MEM_C), ("disk", DISK_C)):
             pts = []
             for r in d["rows"]:
                 if r[key] is not None:
-                    pts += [x0 + (r["ts"] - d["c0"]) / span * (x1 - x0), y + h - min(r[key], 100) / 100 * h]
+                    pts += [px0 + (r["ts"] - d["c0"]) / span * (px1 - px0), base - min(r[key], 100) / 100 * (base - top)]
             if len(pts) >= 4:
                 c.create_line(*pts, width=2, fill=color)
-        lx = x1
-        for text, color in (("DISK", DISK_COLOR), ("MEMORY", MEM_COLOR), ("CPU", ACCENT)):
-            w = self.hfont.measure(text)
-            c.create_text(lx - 6, y + 12, text=text, anchor="e", fill=color, font=self.hfont)
-            lx -= w + 18
-        c.create_text(x0, y + h + 12, text=fmt_clock(d["c0"]), anchor="w", fill=t["muted"], font=(FONT, 9))
-        c.create_text(x1, y + h + 12, text=fmt_clock(d["c1"]), anchor="e", fill=t["muted"], font=(FONT, 9))
-        return y + h + 12
+        lx = x1 - 16
+        for name, color in (("DISK", DISK_C), ("MEMORY", MEM_C), ("CPU", CPU_C)):
+            w = self.hfont.measure(name)
+            self.caps(lx, y + 16, name, "e", color)
+            lx -= w + 20
+        self.caps(px0, y + 16, "LOAD OVER TIME")
+        self.text(px0, y + h - 10, fmt_clock(d["c0"]), 8, t["muted"])
+        self.text(px1, y + h - 10, fmt_clock(d["c1"]), 8, t["muted"], anchor="e")
+        return y + h
 
     def table(self, y, table):
-        c, t = self.c, self.t
-        room = int((H - 24 - y - 26) // 22)
+        t = self.t
+        x0, x1 = SB + PAD, W - PAD
+        room = int((H - 24 - y - 50) // 24)
         if not table or room < 1:
             return
-        for text, x, anchor in (("PROGRAM", PAD, "w"), ("WHAT IT IS", 200, "w"), ("CPU", 560, "e"),
-                                ("MEMORY", 650, "e"), ("I/O", W - PAD, "e")):
-            c.create_text(x, y, text=text, anchor=anchor, fill=t["muted"], font=self.hfont)
-        y += 24
-        for name, cpu, rss, io in table[:min(6, room)]:
+        n = min(6, room, len(table))
+        self.card(x0, y, x1, y + 40 + n * 24)
+        cols = ((x0 + 18, "w", "PROGRAM"), (x0 + 190, "w", "WHAT IT IS"), (x1 - 220, "e", "CPU"),
+                (x1 - 130, "e", "MEMORY"), (x1 - 18, "e", "I/O"))
+        for x, anchor, text in cols:
+            self.caps(x, y + 18, text, anchor)
+        ry = y + 46
+        for name, cpu, rss, io in table[:n]:
             known = KNOWN.get(name.lower())
-            c.create_text(PAD, y, text=clip(name, 20), anchor="w", fill=t["text"], font=(FONT, 10))
-            c.create_text(200, y, text=clip(known[0], 44) if known else "", anchor="w", fill=t["muted"], font=(FONT, 9))
-            c.create_text(560, y, text=f"{cpu:.0f}%", anchor="e", fill=t["text"], font=(FONT, 10))
-            c.create_text(650, y, text=fmt_mb(rss), anchor="e", fill=t["text"], font=(FONT, 10))
-            c.create_text(W - PAD, y, text=f"{io:.1f} MB/s", anchor="e", fill=t["text"], font=(FONT, 10))
-            y += 22
+            self.text(x0 + 18, ry, clip(name, 20), 10)
+            self.text(x0 + 190, ry, clip(known[0], 42) if known else "", 9, t["muted"])
+            self.text(x1 - 220, ry, f"{cpu:.0f}%", 10, anchor="e", fam=MONO)
+            self.text(x1 - 130, ry, fmt_mb(rss), 10, anchor="e", fam=MONO)
+            self.text(x1 - 18, ry, f"{io:.1f} MB/s", 10, anchor="e", fam=MONO)
+            ry += 24
 
     def draw_settings(self):
         c, t = self.c, self.t
-        self.header([("BACK", lambda e, d: self.go("main"), ACCENT)], status=False)
-        c.create_text(PAD, 62, text="Settings", anchor="w", fill=t["text"], font=(FONT, 14, "bold"))
-        y = 112
-        for text, key, kind, opts in SETTING_ROWS:
-            c.create_text(PAD, y, text=text, anchor="w", fill=ACCENT if kind == ACTION else t["text"], font=(FONT, 10))
-            if kind == TOGGLE:
-                on, cx = self.s[key], W - PAD - 16
-                c.create_line(cx - 14, y, cx + 14, y, width=18, capstyle="round", fill=ACCENT if on else t["calm"])
-                kx = cx + 7 if on else cx - 7
-                c.create_oval(kx - 6, y - 6, kx + 6, y + 6, fill="#ffffff" if on else t["muted"], outline="")
-            elif kind == CHOICE:
-                shown = next((lab for v, lab in opts if v == self.s[key]), str(self.s[key]))
-                c.create_text(W - PAD, y, text=shown, anchor="e", fill=ACCENT, font=(FONT, 10))
-            self.hits.append((0, y - 17, W, y + 17,
-                              lambda e, d, k=key, kd=kind, o=opts: self.setting_action(k, kd, o, d)))
-            y += 38
-        c.create_text(PAD, H - 28, anchor="w", fill=t["muted"], font=(FONT, 9),
-                      text=f"Black Box v{VERSION}. Click a value to change it, right-click to step back. "
-                           "Everything is stored only on this PC.")
+        x0, x1 = SB + PAD, W - PAD
+        self.text(x0, 38, "Settings", 20, weight="bold", fam=HEAD)
+        rows = {key: (label, kind, opts) for label, key, kind, opts in SETTING_ROWS}
+        y = 78
+        for group, keys in SETTING_GROUPS:
+            self.caps(x0, y + 6, group)
+            top = y + 22
+            self.card(x0, top, x1, top + len(keys) * 36 + 4)
+            for i, key in enumerate(keys):
+                label, kind, opts = rows[key]
+                ry = top + 22 + i * 36
+                if i:
+                    c.create_line(x0 + 16, ry - 18, x1 - 16, ry - 18, fill=t["line"])
+                self.text(x0 + 18, ry, label, 10, t["acc"] if kind == ACTION else t["text"])
+                if kind == TOGGLE:
+                    on = self.s[key]
+                    self.rrect(x1 - 62, ry - 10, x1 - 18, ry + 10, 10, t["acc"] if on else t["line"])
+                    kx = x1 - 28 if on else x1 - 52
+                    c.create_oval(kx - 7, ry - 7, kx + 7, ry + 7, fill="#ffffff" if on else t["muted"], outline="")
+                elif kind == CHOICE:
+                    shown = next((lab for v, lab in opts if v == self.s[key]), str(self.s[key]))
+                    cw = self.mfont.measure(shown) + 28
+                    self.rrect(x1 - 18 - cw, ry - 12, x1 - 18, ry + 12, 12, t["bg"], t["line"])
+                    self.text(x1 - 18 - cw / 2, ry, shown, 10, t["acc"], "bold", HEAD, "center")
+                self.hits.append((x0, ry - 18, x1, ry + 18,
+                                  lambda e, d, k=key, kd=kind, o=opts: self.setting_action(k, kd, o, d)))
+            y = top + len(keys) * 36 + 4 + 14
+        self.text(x0, H - 22, "Click a value to change it, right-click to step back. Everything is stored only on this PC.",
+                  9, t["muted"])
 
 
 def main():
